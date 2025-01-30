@@ -8,87 +8,82 @@ from utils.Collator import DataCollatorForSupervisedDataset
 from typing import Dict, List, Union
 import logging
 from transformers.trainer_utils import is_main_process
+import argparse
+from trl import (
+    ModelConfig,
+    ScriptArguments,
+    SFTConfig,
+    SFTTrainer,
+    TrlParser,
+    DataCollatorForCompletionOnlyLM,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+)
 
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 IGNORE_INDEX = -100
 
 
-def main(training_args: TrainingArguments):
+def main(script_args, training_args, model_args):
     # 1. 교사 모델 및 토크나이저 로드
-    system_prompt = "You are a helpful chatbot. Respond in the same language as the user's question."
-    model_name = "microsoft/phi-4"  # 원하는 모델 이름으로 변경 가능
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=8192, truncation_side="left")
-    instruct_dataset1 = load_dataset("json", data_files="")["train"]
-    instruct_dataset1 = instruct_dataset1.shuffle(seed=42).select(range(250))
+    system_prompt = "당신은 Alibaba Cloud에 의해 만들어진 Qwen입니다. 당신은 도움이 되는 어시스턴트입니다."
+    quantization_config = get_quantization_config(model_args)
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=model_args.torch_dtype,
+        use_cache=False if training_args.gradient_checkpointing else True,
+        device_map=get_kbit_device_map() if quantization_config is not None else None,
+        quantization_config=quantization_config,
+    )
+    training_args.model_init_kwargs = model_kwargs
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
+    )
+    dataset = load_dataset("json", data_files="")["train"]
+    dataset = dataset.shuffle(seed=42).select(range(250))
 
-    def raw_to_sft_fromat(row):
-        # 각종 포맷을 input, instruction, output의 컬럼만 남기고 전처리 하는 함수
-        inputs = ""
-        instruction = ""
-        output = ""
-        if "input" in row:
-            inputs = row["input"]
+    def raw_to_sft_format(row):
+        """input, instruction, output 컬럼만 남기고 전처리하는 함수"""
+        row["input"] = (row.get("input", "")).strip()
 
-        if "instruction" in row:
-            instruction = row["instruction"]
-        if "question" in row:
-            instruction = row["question"]
-        if "prompt" in row:
-            instruction = row["prompt"]
+        # instruction은 여러 필드 중 하나를 선택
+        row["instruction"] = (row.get("instruction") or row.get("question") or row.get("prompt") or "").strip()
 
-        if "output" in row:
-            output = row["output"]
-        if "chosen" in row:
-            output = row["chosen"]
-        if "response" in row:
-            output = row["response"]
+        # output은 여러 필드 중 하나를 선택
+        row["output"] = (row.get("output") or row.get("chosen") or row.get("response") or "").strip()
 
-        row["input"] = inputs
-        row["instruction"] = instruction
-        row["output"] = output
         return row
 
     def get_remove_columns_names(total_column_names):
         sft_column_names = ["input", "instruction", "output"]
         return list(set(total_column_names).difference(sft_column_names))
 
-    instruct_dataset1 = instruct_dataset1.map(
-        raw_to_sft_fromat, remove_columns=get_remove_columns_names(instruct_dataset1.column_names), num_proc=8
-    )
-
-    def instruct_dataset_preprocess(row):
+    def instruct_dataset_preprocess(row, tokenizer: AutoTokenizer):
         if not row["input"] == "":
             row["instruction"] += "\n" + row["input"]
 
-        input_text = row["instruction"]
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": input_text}]
-        input_template_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        label_text = f"{row['output']}<|im_end|>"
-
-        total_text = input_template_text + label_text
-
-        input_seq_token_len = len(tokenizer(input_template_text, add_special_tokens=False)["input_ids"])
-        tokenized_text = tokenizer(
-            total_text, return_token_type_ids=False, return_tensors="pt", add_special_tokens=False
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ]
+        tokenized_text = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False, truncation=False
         )
 
-        labels_ids = deepcopy(tokenized_text["input_ids"][0])
-        labels_ids[:input_seq_token_len] = IGNORE_INDEX
-
-        row["input_ids"] = tokenized_text["input_ids"][0]
-        row["attention_mask"] = tokenized_text["attention_mask"][0]
-        row["labels"] = labels_ids
-        row["lengths"] = len(tokenized_text["input_ids"][0])
+        row["input_ids"] = tokenized_text
         return row
 
-    instruct_dataset1 = instruct_dataset1.map(
-        instruct_dataset_preprocess, remove_columns=instruct_dataset1.column_names, num_proc=8
+    dataset = dataset.map(raw_to_sft_format, remove_columns=get_remove_columns_names(dataset.column_names), num_proc=8)
+    dataset = dataset.map(
+        instruct_dataset_preprocess,
+        remove_columns=dataset.column_names,
+        num_proc=8,
+        fn_kwargs={"tokenizer": tokenizer},
     )
-    asis_len = len(instruct_dataset1)
-    dataset = instruct_dataset1.filter(lambda x: x["lengths"] <= 8192)
-    logging.info(f"dataset length to {asis_len} -> {len(dataset)}")
     total_result = list()
 
     def compute_metrics(pred: Dict[str, Union[List[int], torch.Tensor]], compute_result) -> Dict[str, float]:
@@ -140,8 +135,17 @@ def main(training_args: TrainingArguments):
         metrics = {"log_prob": log_probs, "entropy": entropies, "accuracy": accuracies}
         return metrics
 
-    collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    trainer = Trainer(model=model, data_collator=collator, args=training_args, compute_metrics=compute_metrics)
+    collator = DataCollatorForCompletionOnlyLM(
+        tokenizer=tokenizer, instruction_template="<|im_start|>user\n", response_template="<|im_start|>assistant\n"
+    )
+    trainer = SFTTrainer(
+        model=model_args.model_name_or_path,
+        args=training_args,
+        processing_class=tokenizer,
+        data_collator=collator,
+        compute_metrics=compute_metrics,
+        peft_config=get_peft_config(model_args),
+    )
     pred_output = trainer.evaluate(eval_dataset=dataset)
     df = pd.DataFrame(total_result, columns=["log_prob", "entropy", "accuracy"])
     # 열별 통계 계산
@@ -155,12 +159,16 @@ def main(training_args: TrainingArguments):
     print("\nQuantiles per column:\n", quantiles_per_column)
 
 
+def make_parser(subparsers: argparse._SubParsersAction = None):
+    dataclass_types = (ScriptArguments, SFTConfig, ModelConfig)
+    if subparsers is not None:
+        parser = subparsers.add_parser("sft", help="Run the SFT training script", dataclass_types=dataclass_types)
+    else:
+        parser = TrlParser(dataclass_types)
+    return parser
+
+
 if __name__ == "__main__":
-    parser = HfArgumentParser((TrainingArguments))
-    training_args = parser.parse_args_into_dataclasses()
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if is_main_process(training_args[0].local_rank) else logging.WARN,
-    )
-    main(training_args=training_args[0])
+    parser = make_parser()
+    script_args, training_args, model_args = parser.parse_args_and_config()
+    main(script_args, training_args, model_args)
